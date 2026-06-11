@@ -2,12 +2,12 @@
 Start-Toolkit.ps1
 Outil interactif AD / GPO / SMB pour Windows Server AD.
 
-À lancer sur :
-- Contrôleur de domaine
+A lancer sur :
+- Controleur de domaine
 ou
 - Serveur Windows avec RSAT ActiveDirectory + GroupPolicy
 
-Modules nécessaires :
+Modules necessaires :
 - ActiveDirectory
 - GroupPolicy
 - SmbShare
@@ -23,6 +23,13 @@ $ErrorActionPreference = "Stop"
 
 $Global:DryRun = $false
 $Global:LogPath = "C:\Logs\AD-GPO-Toolkit.log"
+$Global:RequiredModules = @("ActiveDirectory", "GroupPolicy", "SmbShare")
+$Global:ModuleStatus = @{}
+$Global:Domain = $null
+$Global:DomainDN = $null
+$Global:DomainDNS = "Non detecte"
+$Global:NetBIOS = $env:USERDOMAIN
+$Global:SysvolScripts = $null
 
 if (-not (Test-Path "C:\Logs")) {
     New-Item -ItemType Directory -Path "C:\Logs" -Force | Out-Null
@@ -34,8 +41,16 @@ function Write-Log {
         [string]$Level = "INFO"
     )
 
-    $Line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Level] $Message"
-    Add-Content -Path $Global:LogPath -Value $Line
+    try {
+        if (-not (Test-Path "C:\Logs")) {
+            New-Item -ItemType Directory -Path "C:\Logs" -Force | Out-Null
+        }
+
+        $Line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Level] $Message"
+        Add-Content -Path $Global:LogPath -Value $Line
+    } catch {
+        Write-Host "Impossible d'ecrire dans le log $($Global:LogPath) : $($_.Exception.Message)" -ForegroundColor DarkYellow
+    }
 }
 
 function Write-Info {
@@ -64,7 +79,7 @@ function Write-ErrorMsg {
 
 function Pause-Toolkit {
     Write-Host ""
-    Read-Host "Appuie sur Entrée pour continuer"
+    Read-Host "Appuie sur Entree pour continuer"
 }
 
 function Confirm-Action {
@@ -144,7 +159,7 @@ function Test-UNCPathExists {
 }
 
 function Read-DriveLetter {
-    $DriveLetter = Read-RequiredValue "Lettre du lecteur réseau, exemple S"
+    $DriveLetter = Read-RequiredValue "Lettre du lecteur reseau, exemple S"
     if (-not $DriveLetter) { return $null }
 
     $DriveLetter = $DriveLetter.TrimEnd(":").ToUpper()
@@ -157,26 +172,208 @@ function Read-DriveLetter {
     return $DriveLetter
 }
 
-try {
-    Import-Module ActiveDirectory
-    Import-Module GroupPolicy
-    Import-Module SmbShare
-} catch {
-    Write-ErrorMsg "Impossible de charger les modules nécessaires : $($_.Exception.Message)"
+function Test-IsAdministrator {
+    try {
+        $Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $Principal = New-Object Security.Principal.WindowsPrincipal($Identity)
+        return $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false
+    }
+}
+
+function Write-CheckResult {
+    param(
+        [string]$Label,
+        [bool]$Success,
+        [string]$Detail = ""
+    )
+
+    if ($Success) {
+        Write-Host "[OK] $Label $Detail" -ForegroundColor Green
+        Write-Log "[OK] $Label $Detail" "INFO"
+    } else {
+        Write-Host "[ERREUR] $Label $Detail" -ForegroundColor Red
+        Write-Log "[ERREUR] $Label $Detail" "ERROR"
+    }
+}
+
+function Invoke-ToolkitCommand {
+    param(
+        [string]$Description,
+        [string]$Command
+    )
+
+    if ($Global:DryRun) {
+        Write-WarningMsg "[DRY-RUN] $Description : $Command"
+        return $true
+    }
+
+    try {
+        Write-Info $Description
+        Write-Log "Commande : $Command" "INFO"
+        $Output = Invoke-Expression -Command $Command 2>&1
+
+        if ($Output) {
+            $Output | ForEach-Object {
+                Write-Host $_
+                Write-Log $_ "INFO"
+            }
+        }
+
+        if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+            Write-ErrorMsg "Commande terminee avec le code $LASTEXITCODE : $Command"
+            return $false
+        }
+
+        Write-Success "Commande terminee : $Command"
+        return $true
+    } catch {
+        Write-ErrorMsg "Erreur pendant '$Description' : $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Test-ToolkitEnvironment {
+    Clear-Host
+    Write-Host "===== VERIFICATION ENVIRONNEMENT =====" -ForegroundColor Cyan
+
+    Write-CheckResult -Label "Execution en administrateur" -Success (Test-IsAdministrator)
+
+    foreach ($ModuleName in $Global:RequiredModules) {
+        $Available = [bool](Get-Module -ListAvailable -Name $ModuleName)
+        Write-CheckResult -Label "Module $ModuleName disponible" -Success $Available
+    }
+
+    try {
+        $Domain = Get-ADDomain -ErrorAction Stop
+        Write-CheckResult -Label "Acces au domaine AD" -Success $true -Detail $Domain.DNSRoot
+    } catch {
+        Write-CheckResult -Label "Acces au domaine AD" -Success $false -Detail $_.Exception.Message
+    }
+
+    $SysvolOk = $false
+    if ($Global:SysvolScripts) {
+        try {
+            $SysvolOk = Test-Path -Path $Global:SysvolScripts
+        } catch {
+            $SysvolOk = $false
+        }
+    }
+    Write-CheckResult -Label "Acces SYSVOL scripts" -Success $SysvolOk -Detail $Global:SysvolScripts
+
+    try {
+        if (-not (Test-Path "C:\Logs")) {
+            New-Item -ItemType Directory -Path "C:\Logs" -Force | Out-Null
+        }
+        Write-CheckResult -Label "Dossier C:\Logs existant" -Success (Test-Path "C:\Logs")
+    } catch {
+        Write-CheckResult -Label "Dossier C:\Logs existant" -Success $false -Detail $_.Exception.Message
+    }
+
+    try {
+        $Service = Get-Service -Name LanmanServer -ErrorAction Stop
+        Write-CheckResult -Label "Service LanmanServer actif" -Success ($Service.Status -eq "Running") -Detail $Service.Status
+    } catch {
+        Write-CheckResult -Label "Service LanmanServer actif" -Success $false -Detail $_.Exception.Message
+    }
+
+    try {
+        Get-SmbShare -ErrorAction Stop | Out-Null
+        Write-CheckResult -Label "Droits SMB / lecture partages" -Success $true
+    } catch {
+        Write-CheckResult -Label "Droits SMB / lecture partages" -Success $false -Detail $_.Exception.Message
+    }
+
+    Write-CheckResult -Label "Droits creation partage SMB probables" -Success ((Test-IsAdministrator) -and [bool](Get-Command New-SmbShare -ErrorAction SilentlyContinue))
+    Write-CheckResult -Label "Commande gpupdate disponible" -Success ([bool](Get-Command gpupdate.exe -ErrorAction SilentlyContinue))
+    Write-CheckResult -Label "Commande gpresult disponible" -Success ([bool](Get-Command gpresult.exe -ErrorAction SilentlyContinue))
+
     Pause-Toolkit
-    exit
+}
+
+function Invoke-GpUpdateLocal {
+    Clear-Host
+    Write-Host "=== GPUPDATE LOCAL ===" -ForegroundColor Cyan
+    Invoke-ToolkitCommand -Description "Lancement gpupdate /force local" -Command "gpupdate /force" | Out-Null
+    Pause-Toolkit
+}
+
+function Invoke-GpResultLocal {
+    Clear-Host
+    Write-Host "=== GPRESULT LOCAL ===" -ForegroundColor Cyan
+    Invoke-ToolkitCommand -Description "Lancement gpresult /r local" -Command "gpresult /r" | Out-Null
+    Pause-Toolkit
+}
+
+function New-GpResultHtmlLocal {
+    Clear-Host
+    Write-Host "=== RAPPORT GPRESULT HTML LOCAL ===" -ForegroundColor Cyan
+
+    $ReportPath = "C:\Logs\gpresult.html"
+
+    if ($Global:DryRun) {
+        Write-WarningMsg "[DRY-RUN] gpresult /h $ReportPath /f"
+        Pause-Toolkit
+        return
+    }
+
+    try {
+        if (-not (Test-Path "C:\Logs")) {
+            New-Item -ItemType Directory -Path "C:\Logs" -Force | Out-Null
+        }
+
+        Write-Info "Generation rapport gpresult HTML"
+        $Process = Start-Process -FilePath "gpresult.exe" -ArgumentList @("/h", $ReportPath, "/f") -Wait -PassThru -NoNewWindow
+
+        if ($Process.ExitCode -eq 0) {
+            Write-Success "Rapport HTML genere : $ReportPath"
+        } else {
+            Write-ErrorMsg "gpresult a retourne le code $($Process.ExitCode)."
+        }
+    } catch {
+        Write-ErrorMsg "Impossible de generer le rapport gpresult HTML : $($_.Exception.Message)"
+    }
+
+    Pause-Toolkit
+}
+
+function Test-CurrentServerGPOApplication {
+    Clear-Host
+    Write-Host "=== TEST APPLICATION GPO SERVEUR ACTUEL ===" -ForegroundColor Cyan
+    Invoke-ToolkitCommand -Description "Mise a jour des GPO locales" -Command "gpupdate /force" | Out-Null
+    Invoke-ToolkitCommand -Description "Resultat des GPO appliquees" -Command "gpresult /r" | Out-Null
+    Pause-Toolkit
+}
+
+foreach ($ModuleName in $Global:RequiredModules) {
+    try {
+        $Available = Get-Module -ListAvailable -Name $ModuleName
+        if ($Available) {
+            Import-Module $ModuleName -ErrorAction Stop
+            $Global:ModuleStatus[$ModuleName] = $true
+        } else {
+            $Global:ModuleStatus[$ModuleName] = $false
+            Write-WarningMsg "Module non disponible : $ModuleName"
+        }
+    } catch {
+        $Global:ModuleStatus[$ModuleName] = $false
+        Write-WarningMsg "Impossible de charger le module $ModuleName : $($_.Exception.Message)"
+    }
 }
 
 try {
-    $Global:Domain = Get-ADDomain
-    $Global:DomainDN = $Global:Domain.DistinguishedName
-    $Global:DomainDNS = $Global:Domain.DNSRoot
-    $Global:NetBIOS = $Global:Domain.NetBIOSName
-    $Global:SysvolScripts = "\\$($Global:DomainDNS)\SYSVOL\$($Global:DomainDNS)\scripts"
+    if (Get-Command Get-ADDomain -ErrorAction SilentlyContinue) {
+        $Global:Domain = Get-ADDomain -ErrorAction Stop
+        $Global:DomainDN = $Global:Domain.DistinguishedName
+        $Global:DomainDNS = $Global:Domain.DNSRoot
+        $Global:NetBIOS = $Global:Domain.NetBIOSName
+        $Global:SysvolScripts = "\\$($Global:DomainDNS)\SYSVOL\$($Global:DomainDNS)\scripts"
+    } else {
+        Write-WarningMsg "Commande Get-ADDomain indisponible. Lance Verifier l'environnement pour le detail."
+    }
 } catch {
-    Write-ErrorMsg "Impossible de détecter le domaine AD."
-    Pause-Toolkit
-    exit
+    Write-WarningMsg "Impossible de detecter le domaine AD : $($_.Exception.Message)"
 }
 
 # =========================
@@ -187,10 +384,15 @@ function Select-OU {
     Clear-Host
     Write-Host "=== SELECTION OU ===" -ForegroundColor Cyan
 
-    $OUs = Get-ADOrganizationalUnit -Filter * | Sort-Object DistinguishedName
+    try {
+        $OUs = @(Get-ADOrganizationalUnit -Filter * | Sort-Object DistinguishedName)
+    } catch {
+        Write-ErrorMsg "Impossible de lister les OU : $($_.Exception.Message)"
+        return $null
+    }
 
     if (-not $OUs) {
-        Write-ErrorMsg "Aucune OU trouvée."
+        Write-ErrorMsg "Aucune OU trouvee."
         return $null
     }
 
@@ -199,7 +401,7 @@ function Select-OU {
     }
 
     Write-Host ""
-    $Choice = Read-Host "Numéro de l'OU"
+    $Choice = Read-Host "Numero de l'OU"
 
     if ($Choice -match '^\d+$' -and [int]$Choice -ge 1 -and [int]$Choice -le $OUs.Count) {
         return $OUs[[int]$Choice - 1].DistinguishedName
@@ -213,10 +415,15 @@ function Select-GPO {
     Clear-Host
     Write-Host "=== SELECTION GPO EXISTANTE ===" -ForegroundColor Cyan
 
-    $GPOs = Get-GPO -All | Sort-Object DisplayName
+    try {
+        $GPOs = @(Get-GPO -All | Sort-Object DisplayName)
+    } catch {
+        Write-ErrorMsg "Impossible de lister les GPO : $($_.Exception.Message)"
+        return $null
+    }
 
     if (-not $GPOs) {
-        Write-ErrorMsg "Aucune GPO trouvée."
+        Write-ErrorMsg "Aucune GPO trouvee."
         return $null
     }
 
@@ -225,7 +432,7 @@ function Select-GPO {
     }
 
     Write-Host ""
-    $Choice = Read-Host "Numéro de la GPO"
+    $Choice = Read-Host "Numero de la GPO"
 
     if ($Choice -match '^\d+$' -and [int]$Choice -ge 1 -and [int]$Choice -le $GPOs.Count) {
         return $GPOs[[int]$Choice - 1].DisplayName
@@ -247,7 +454,7 @@ function Select-Group {
     }
 
     if (-not $Groups) {
-        Write-ErrorMsg "Aucun groupe AD trouvé."
+        Write-ErrorMsg "Aucun groupe AD trouve."
         return $null
     }
 
@@ -256,10 +463,10 @@ function Select-Group {
     }
 
     Write-Host ""
-    $Choice = Read-Host "Numéro du groupe"
+    $Choice = Read-Host "Numero du groupe"
 
     if ($Choice -match '^\d+$' -and [int]$Choice -ge 1 -and [int]$Choice -le $Groups.Count) {
-        return $Groups[[int]$Choice - 1].Name
+        return $Groups[[int]$Choice - 1].SamAccountName
     }
 
     Write-ErrorMsg "Choix invalide."
@@ -282,7 +489,7 @@ function Show-ToolkitSmbShares {
     $Shares = @(Get-ToolkitSmbShares)
 
     if (-not $Shares) {
-        Write-WarningMsg "Aucun partage SMB utilisateur trouvé sur ce serveur."
+        Write-WarningMsg "Aucun partage SMB utilisateur trouve sur ce serveur."
     } else {
         $Shares |
             Select-Object Name, Path, Description |
@@ -299,7 +506,7 @@ function Select-SmbShare {
     $Shares = @(Get-ToolkitSmbShares)
 
     if (-not $Shares) {
-        Write-WarningMsg "Aucun partage SMB utilisateur trouvé sur ce serveur."
+        Write-WarningMsg "Aucun partage SMB utilisateur trouve sur ce serveur."
         return $null
     }
 
@@ -309,7 +516,7 @@ function Select-SmbShare {
     }
 
     Write-Host ""
-    $Choice = Read-Host "Numéro du partage"
+    $Choice = Read-Host "Numero du partage"
 
     if ($Choice -match '^\d+$' -and [int]$Choice -ge 1 -and [int]$Choice -le $Shares.Count) {
         return (Get-UNCPathFromShareName -ShareName $Shares[[int]$Choice - 1].Name)
@@ -340,7 +547,7 @@ function Test-ToolkitUNCPath {
 
 function Read-UNCPathForMappedDrive {
     Write-Host ""
-    Write-Host "Source du lecteur réseau :"
+    Write-Host "Source du lecteur reseau :"
     Write-Host "1. Utiliser un partage SMB existant sur ce serveur"
     Write-Host "2. Saisir un chemin UNC manuellement"
     Write-Host ""
@@ -356,12 +563,12 @@ function Read-UNCPathForMappedDrive {
             if (-not $UNCPath) { return $null }
 
             if (-not (Test-UNCPathFormat -UNCPath $UNCPath)) {
-                Write-WarningMsg "Le chemin ne ressemble pas à un UNC valide."
+                Write-WarningMsg "Le chemin ne ressemble pas a un UNC valide."
                 return $null
             }
 
             if (-not (Test-UNCPathExists -UNCPath $UNCPath)) {
-                if (-not (Confirm-Action "Le chemin n'est pas accessible depuis ce serveur. Continuer quand même ?")) {
+                if (-not (Confirm-Action "Le chemin n'est pas accessible depuis ce serveur. Continuer quand meme ?")) {
                     return $null
                 }
             }
@@ -385,20 +592,20 @@ function Ensure-GPO {
     try {
         $Existing = Get-GPO -Name $GPOName -ErrorAction SilentlyContinue
     } catch {
-        Write-ErrorMsg "Impossible de vérifier la GPO $GPOName : $($_.Exception.Message)"
+        Write-ErrorMsg "Impossible de verifier la GPO $GPOName : $($_.Exception.Message)"
         return $null
     }
 
     if ($Existing) {
-        Write-WarningMsg "GPO déjà existante : $GPOName"
+        Write-WarningMsg "GPO deja existante : $GPOName"
         return $Existing
     }
 
-    if (-not (Confirm-Action "Créer la GPO $GPOName ?")) {
+    if (-not (Confirm-Action "Creer la GPO $GPOName ?")) {
         return $null
     }
 
-    if (-not (Invoke-SafeAction "Création de la GPO : $GPOName" {
+    if (-not (Invoke-SafeAction "Creation de la GPO : $GPOName" {
         New-GPO -Name $GPOName | Out-Null
     })) {
         return $null
@@ -413,7 +620,7 @@ function Ensure-GPO {
     try {
         return Get-GPO -Name $GPOName
     } catch {
-        Write-ErrorMsg "La GPO $GPOName n'a pas pu être relue après création : $($_.Exception.Message)"
+        Write-ErrorMsg "La GPO $GPOName n'a pas pu etre relue apres creation : $($_.Exception.Message)"
         return $null
     }
 }
@@ -428,23 +635,23 @@ function Link-GPO-ToOU {
         $Links = Get-GPInheritance -Target $OUPath | Select-Object -ExpandProperty GpoLinks
         $AlreadyLinked = $Links | Where-Object { $_.DisplayName -eq $GPOName }
     } catch {
-        Write-ErrorMsg "Impossible de vérifier les liens GPO de $OUPath : $($_.Exception.Message)"
+        Write-ErrorMsg "Impossible de verifier les liens GPO de $OUPath : $($_.Exception.Message)"
         return $false
     }
 
     if ($AlreadyLinked) {
-        Write-WarningMsg "La GPO $GPOName est déjà liée à cette OU."
+        Write-WarningMsg "La GPO $GPOName est deja liee a cette OU."
         return $true
     }
 
-    if (-not (Confirm-Action "Lier la GPO $GPOName à $OUPath ?")) {
+    if (-not (Confirm-Action "Lier la GPO $GPOName a $OUPath ?")) {
         return $false
     }
 
     if (Invoke-SafeAction "Liaison de la GPO $GPOName vers $OUPath" {
         New-GPLink -Name $GPOName -Target $OUPath -LinkEnabled Yes | Out-Null
     }) {
-        Write-Success "GPO liée avec succès."
+        Write-Success "GPO liee avec succes."
         return $true
     }
 
@@ -462,7 +669,7 @@ function Complete-GPOConfiguration {
     if ($Linked) {
         Write-Success $SuccessMessage
     } else {
-        Write-WarningMsg "$SuccessMessage La GPO n'a pas été liée à une OU."
+        Write-WarningMsg "$SuccessMessage La GPO n'a pas ete liee a une OU."
     }
 }
 
@@ -520,16 +727,22 @@ function New-ToolkitOU {
 
     $OUPath = "OU=$OUName,$ParentPath"
 
-    $Exists = Get-ADOrganizationalUnit -LDAPFilter "(distinguishedName=$OUPath)" -ErrorAction SilentlyContinue
+    try {
+        $Exists = Get-ADOrganizationalUnit -LDAPFilter "(distinguishedName=$OUPath)" -ErrorAction SilentlyContinue
+    } catch {
+        Write-ErrorMsg "Impossible de verifier l'OU : $($_.Exception.Message)"
+        Pause-Toolkit
+        return
+    }
 
     if ($Exists) {
-        Write-WarningMsg "OU déjà existante : $OUPath"
+        Write-WarningMsg "OU deja existante : $OUPath"
     } else {
-        if (Confirm-Action "Créer l'OU $OUPath ?") {
-            if (Invoke-SafeAction "Création OU : $OUPath" {
+        if (Confirm-Action "Creer l'OU $OUPath ?") {
+            if (Invoke-SafeAction "Creation OU : $OUPath" {
                 New-ADOrganizationalUnit -Name $OUName -Path $ParentPath -ProtectedFromAccidentalDeletion $true
             }) {
-                Write-Success "OU créée."
+                Write-Success "OU creee."
             }
         }
     }
@@ -545,7 +758,7 @@ function New-ToolkitGroup {
     $Description = Read-Host "Description"
 
     Write-Host ""
-    Write-Host "Portée du groupe :"
+    Write-Host "Portee du groupe :"
     Write-Host "1. Global"
     Write-Host "2. DomainLocal"
     Write-Host "3. Universal"
@@ -562,13 +775,20 @@ function New-ToolkitGroup {
     $OUPath = Select-OU
     if (-not $OUPath) { return }
 
-    $Exists = Get-ADGroup -Filter "SamAccountName -eq '$GroupName'" -ErrorAction SilentlyContinue
+    try {
+        $EscapedGroupName = $GroupName.Replace("'", "''")
+        $Exists = Get-ADGroup -Filter "SamAccountName -eq '$EscapedGroupName'" -ErrorAction SilentlyContinue
+    } catch {
+        Write-ErrorMsg "Impossible de verifier le groupe : $($_.Exception.Message)"
+        Pause-Toolkit
+        return
+    }
 
     if ($Exists) {
-        Write-WarningMsg "Groupe déjà existant."
+        Write-WarningMsg "Groupe deja existant."
     } else {
-        if (Confirm-Action "Créer le groupe $GroupName dans $OUPath ?") {
-            if (Invoke-SafeAction "Création groupe : $GroupName" {
+        if (Confirm-Action "Creer le groupe $GroupName dans $OUPath ?") {
+            if (Invoke-SafeAction "Creation groupe : $GroupName" {
                 New-ADGroup `
                     -Name $GroupName `
                     -SamAccountName $GroupName `
@@ -577,7 +797,7 @@ function New-ToolkitGroup {
                     -Description $Description `
                     -Path $OUPath
             }) {
-                Write-Success "Groupe créé."
+                Write-Success "Groupe cree."
             }
         }
     }
@@ -589,7 +809,7 @@ function New-ToolkitUser {
     Clear-Host
     Write-Host "=== CREER UN UTILISATEUR AD ===" -ForegroundColor Cyan
 
-    $FirstName = Read-Host "Prénom"
+    $FirstName = Read-Host "Prenom"
     $LastName = Read-Host "Nom"
     $Login = Read-Host "Login"
     $Password = Read-Host "Mot de passe temporaire" -AsSecureString
@@ -597,13 +817,23 @@ function New-ToolkitUser {
     $OUPath = Select-OU
     if (-not $OUPath) { return }
 
-    $Exists = Get-ADUser -Filter "SamAccountName -eq '$Login'" -ErrorAction SilentlyContinue
+    try {
+        $EscapedLogin = $Login.Replace("'", "''")
+        $Exists = Get-ADUser -Filter "SamAccountName -eq '$EscapedLogin'" -ErrorAction SilentlyContinue
+    } catch {
+        Write-ErrorMsg "Impossible de verifier l'utilisateur : $($_.Exception.Message)"
+        Pause-Toolkit
+        return
+    }
+
+    $UserReady = $false
 
     if ($Exists) {
-        Write-WarningMsg "Utilisateur déjà existant."
+        Write-WarningMsg "Utilisateur deja existant."
+        $UserReady = $true
     } else {
-        if (Confirm-Action "Créer l'utilisateur $Login dans $OUPath ?") {
-            if (Invoke-SafeAction "Création utilisateur : $Login" {
+        if (Confirm-Action "Creer l'utilisateur $Login dans $OUPath ?") {
+            if (Invoke-SafeAction "Creation utilisateur : $Login" {
                 New-ADUser `
                     -Name "$FirstName $LastName" `
                     -GivenName $FirstName `
@@ -615,19 +845,19 @@ function New-ToolkitUser {
                     -Enabled $true `
                     -ChangePasswordAtLogon $true
             }) {
-                Write-Success "Utilisateur créé."
+                Write-Success "Utilisateur cree."
+                $UserReady = $true
             }
         }
     }
 
-    $AddGroup = Confirm-Action "Ajouter cet utilisateur à un groupe maintenant ?"
-    if ($AddGroup) {
+    if ($UserReady -and (Confirm-Action "Ajouter cet utilisateur a un groupe maintenant ?")) {
         $GroupName = Select-Group
         if ($GroupName) {
             if (Invoke-SafeAction "Ajout de $Login au groupe $GroupName" {
                 Add-ADGroupMember -Identity $GroupName -Members $Login
             }) {
-                Write-Success "Utilisateur ajouté au groupe."
+                Write-Success "Utilisateur ajoute au groupe."
             }
         }
     }
@@ -644,11 +874,19 @@ function Add-ToolkitUserToGroup {
 
     if (-not $GroupName) { return }
 
+    try {
+        Get-ADUser -Identity $Login -ErrorAction Stop | Out-Null
+    } catch {
+        Write-ErrorMsg "Utilisateur introuvable : $Login"
+        Pause-Toolkit
+        return
+    }
+
     if (Confirm-Action "Ajouter $Login au groupe $GroupName ?") {
         if (Invoke-SafeAction "Ajout utilisateur au groupe" {
             Add-ADGroupMember -Identity $GroupName -Members $Login
         }) {
-            Write-Success "Utilisateur ajouté au groupe."
+            Write-Success "Utilisateur ajoute au groupe."
         }
     }
 
@@ -666,26 +904,74 @@ function New-ToolkitSharedFolder {
     $FolderPath = Read-RequiredValue "Chemin local du dossier, exemple D:\Partages\Compta"
     if (-not $FolderPath) { return $null }
 
-    $ShareName = Read-RequiredValue "Nom du partage SMB, exemple Compta"
-    if (-not $ShareName) { return $null }
+    $ShareAlreadyExists = $false
+    $ExistingShare = $null
 
-    try {
-        $ExistingShare = Get-SmbShare -Name $ShareName -ErrorAction SilentlyContinue
-    } catch {
-        Write-ErrorMsg "Impossible de vérifier le partage $ShareName : $($_.Exception.Message)"
+    while ($true) {
+        $ShareName = Read-RequiredValue "Nom du partage SMB, exemple Compta"
+        if (-not $ShareName) { return $null }
+        $SelectAnotherShare = $false
+
+        try {
+            $ExistingShare = Get-SmbShare -Name $ShareName -ErrorAction SilentlyContinue
+        } catch {
+            Write-ErrorMsg "Impossible de verifier le partage $ShareName : $($_.Exception.Message)"
+            return $null
+        }
+
+        if ($ExistingShare) {
+            $UNCPath = Get-UNCPathFromShareName -ShareName $ShareName
+            Write-WarningMsg "Partage deja existant : $ShareName"
+            Write-Host "Chemin UNC : $UNCPath"
+            Write-Host "Chemin local actuel : $($ExistingShare.Path)"
+            Write-Host ""
+            Write-Host "Action sur le partage existant :"
+            Write-Host "1. Ne rien faire"
+            Write-Host "2. Mettre a jour les droits"
+            Write-Host "3. Choisir un autre nom de partage"
+            Write-Host ""
+
+            $ExistingChoice = Read-Host "Choix"
+
+            switch ($ExistingChoice) {
+                "1" {
+                    Write-Info "Aucune modification appliquee au partage existant."
+                    Write-Success "Chemin UNC final : $UNCPath"
+                    return $UNCPath
+                }
+                "2" {
+                    $ShareAlreadyExists = $true
+                    $FolderPath = $ExistingShare.Path
+                    break
+                }
+                "3" {
+                    $ShareAlreadyExists = $false
+                    $ExistingShare = $null
+                    $SelectAnotherShare = $true
+                }
+                default {
+                    Write-ErrorMsg "Choix invalide."
+                    return $null
+                }
+            }
+
+            if ($SelectAnotherShare) {
+                continue
+            }
+        }
+
+        break
+    }
+
+    $RootPath = [System.IO.Path]::GetPathRoot($FolderPath)
+    if ([string]::IsNullOrWhiteSpace($RootPath) -or -not (Test-Path -Path $RootPath)) {
+        Write-ErrorMsg "Le disque ou chemin racine n'existe pas : $RootPath"
         return $null
     }
 
-    if ($ExistingShare) {
-        $UNCPath = Get-UNCPathFromShareName -ShareName $ShareName
-        Write-WarningMsg "Partage déjà existant : $ShareName"
-        Write-Info "Chemin UNC existant : $UNCPath"
-        return $UNCPath
-    }
-
     Write-Host ""
-    Write-Host "Choix du groupe autorisé :"
-    Write-Host "1. Sélectionner un groupe existant"
+    Write-Host "Choix du groupe autorise :"
+    Write-Host "1. Selectionner un groupe existant"
     Write-Host "2. Saisir manuellement"
 
     $GroupChoice = Read-Host "Choix"
@@ -698,14 +984,14 @@ function New-ToolkitSharedFolder {
 
     if (-not $GroupName) { return $null }
 
+    $GroupDomain = $Global:NetBIOS
     $AdGroupName = $GroupName
     if ($GroupName -match '^[^\\]+\\[^\\]+$') {
+        $GroupDomain = ($GroupName -split '\\')[0]
         $AdGroupName = ($GroupName -split '\\')[-1]
-        $Identity = $GroupName
-    } else {
-        $Identity = "$($Global:NetBIOS)\$GroupName"
     }
 
+    # L'identite doit exister avant d'etre appliquee dans les ACL NTFS.
     try {
         $GroupExists = Get-ADGroup -Identity $AdGroupName -ErrorAction SilentlyContinue
     } catch {
@@ -713,17 +999,34 @@ function New-ToolkitSharedFolder {
     }
 
     if (-not $GroupExists) {
-        Write-WarningMsg "Groupe AD introuvable : $AdGroupName"
-        if (-not (Confirm-Action "Continuer quand même avec l'identité $Identity ?")) {
-            return $null
+        try {
+            $EscapedGroupName = $AdGroupName.Replace("'", "''")
+            $GroupExists = Get-ADGroup -Filter "SamAccountName -eq '$EscapedGroupName' -or Name -eq '$EscapedGroupName'" -ErrorAction Stop | Select-Object -First 1
+        } catch {
+            $GroupExists = $null
         }
+    }
+
+    if (-not $GroupExists) {
+        Write-ErrorMsg "Groupe AD introuvable : $AdGroupName"
+        return $null
+    }
+
+    $Identity = "$GroupDomain\$($GroupExists.SamAccountName)"
+
+    try {
+        $NtAccount = New-Object System.Security.Principal.NTAccount($Identity)
+        $NtAccount.Translate([System.Security.Principal.SecurityIdentifier]) | Out-Null
+    } catch {
+        Write-ErrorMsg "Identite NTFS invalide ou non resolue : $Identity"
+        return $null
     }
 
     Write-Host ""
     Write-Host "Droits :"
     Write-Host "1. Lecture"
     Write-Host "2. Modification"
-    Write-Host "3. Contrôle total"
+    Write-Host "3. Controle total"
 
     $AccessChoice = Read-Host "Choix"
 
@@ -736,28 +1039,37 @@ function New-ToolkitSharedFolder {
             $SmbAccess = "Full"
             $NtfsRights = "FullControl"
         }
-        default {
+        "2" {
             $SmbAccess = "Change"
             $NtfsRights = "Modify"
+        }
+        default {
+            Write-ErrorMsg "Choix de droits invalide."
+            return $null
         }
     }
 
     $UNCPath = Get-UNCPathFromShareName -ShareName $ShareName
 
     Write-Host ""
-    Write-Host "Résumé :" -ForegroundColor Yellow
+    Write-Host "Resume :" -ForegroundColor Yellow
     Write-Host "Dossier : $FolderPath"
     Write-Host "Partage : $UNCPath"
     Write-Host "Groupe : $Identity"
     Write-Host "Droits SMB : $SmbAccess"
     Write-Host "Droits NTFS : $NtfsRights"
+    if ($ShareAlreadyExists) {
+        Write-Host "Mode : Mise a jour des droits d'un partage existant"
+    } else {
+        Write-Host "Mode : Creation d'un nouveau partage"
+    }
     Write-Host ""
 
-    if (-not (Confirm-Action "Créer/configurer ce partage ?")) {
-        return
+    if (-not (Confirm-Action "Creer/configurer ce partage ?")) {
+        return $null
     }
 
-    if (-not (Invoke-SafeAction "Création dossier si absent : $FolderPath" {
+    if (-not (Invoke-SafeAction "Creation dossier si absent : $FolderPath" {
         if (-not (Test-Path $FolderPath)) {
             New-Item -ItemType Directory -Path $FolderPath -Force | Out-Null
         }
@@ -768,12 +1080,16 @@ function New-ToolkitSharedFolder {
     if (-not (Invoke-SafeAction "Application droits NTFS pour $Identity" {
         $Acl = Get-Acl $FolderPath
 
+        $InheritanceFlags = [System.Security.AccessControl.InheritanceFlags]"ContainerInherit, ObjectInherit"
+        $PropagationFlags = [System.Security.AccessControl.PropagationFlags]"None"
+        $AccessControlType = [System.Security.AccessControl.AccessControlType]"Allow"
+
         $Rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
             $Identity,
             $NtfsRights,
-            "ContainerInherit,ObjectInherit",
-            "None",
-            "Allow"
+            $InheritanceFlags,
+            $PropagationFlags,
+            $AccessControlType
         )
 
         $Acl.SetAccessRule($Rule)
@@ -782,19 +1098,27 @@ function New-ToolkitSharedFolder {
         return $null
     }
 
-    if (-not (Invoke-SafeAction "Création partage SMB : $ShareName" {
-        if ($SmbAccess -eq "Read") {
-            New-SmbShare -Name $ShareName -Path $FolderPath -ReadAccess $Identity | Out-Null
-        } elseif ($SmbAccess -eq "Full") {
-            New-SmbShare -Name $ShareName -Path $FolderPath -FullAccess $Identity | Out-Null
-        } else {
-            New-SmbShare -Name $ShareName -Path $FolderPath -ChangeAccess $Identity | Out-Null
+    if ($ShareAlreadyExists) {
+        if (-not (Invoke-SafeAction "Mise a jour droits SMB : $ShareName" {
+            Grant-SmbShareAccess -Name $ShareName -AccountName $Identity -AccessRight $SmbAccess -Force | Out-Null
+        })) {
+            return $null
         }
-    })) {
-        return $null
+    } else {
+        if (-not (Invoke-SafeAction "Creation partage SMB : $ShareName" {
+            if ($SmbAccess -eq "Read") {
+                New-SmbShare -Name $ShareName -Path $FolderPath -ReadAccess $Identity | Out-Null
+            } elseif ($SmbAccess -eq "Full") {
+                New-SmbShare -Name $ShareName -Path $FolderPath -FullAccess $Identity | Out-Null
+            } else {
+                New-SmbShare -Name $ShareName -Path $FolderPath -ChangeAccess $Identity | Out-Null
+            }
+        })) {
+            return $null
+        }
     }
 
-    Write-Success "Partage créé : $UNCPath"
+    Write-Success "Chemin UNC final : $UNCPath"
 
     return $UNCPath
 }
@@ -822,7 +1146,7 @@ net use $DriveLetter`: /delete /yes >nul 2>&1
 net use $DriveLetter`: "$UNCPath" /persistent:yes
 "@
 
-    if (-not (Invoke-SafeAction "Création script lecteur mappé dans SYSVOL : $ScriptName" {
+    if (-not (Invoke-SafeAction "Creation script lecteur mappe dans SYSVOL : $ScriptName" {
         Set-Content -Path $ScriptPath -Value $ScriptContent -Encoding ASCII
     })) {
         return $false
@@ -870,14 +1194,14 @@ function New-GPO-MappedDrive {
     }
 
     Write-Host ""
-    Write-Host "Résumé lecteur mappé :" -ForegroundColor Yellow
+    Write-Host "Resume lecteur mappe :" -ForegroundColor Yellow
     Write-Host "Chemin UNC : $SharePath"
     Write-Host "Lecteur    : $DriveLetter`:"
     Write-Host "GPO        : $($Context.GPOName)"
     Write-Host "OU cible   : $($Context.OUPath)"
     Write-Host ""
 
-    if (-not (Confirm-Action "Configurer ce mappage de lecteur réseau ?")) {
+    if (-not (Confirm-Action "Configurer ce mappage de lecteur reseau ?")) {
         Pause-Toolkit
         return
     }
@@ -886,9 +1210,9 @@ function New-GPO-MappedDrive {
         $Linked = Link-GPO-ToOU -GPOName $Context.GPOName -OUPath $Context.OUPath
 
         if ($Linked) {
-            Write-Success "GPO lecteur réseau configurée et liée pour $DriveLetter`: -> $SharePath"
+            Write-Success "GPO lecteur reseau configuree et liee pour $DriveLetter`: -> $SharePath"
         } else {
-            Write-WarningMsg "GPO lecteur réseau configurée, mais non liée à une OU."
+            Write-WarningMsg "GPO lecteur reseau configuree, mais non liee a une OU."
         }
     }
 
@@ -898,7 +1222,7 @@ function New-GPO-MappedDrive {
 function New-GPO-BlockCMD {
     Clear-Host
     Write-Host "=== GPO : BLOQUER CMD ===" -ForegroundColor Cyan
-    Write-WarningMsg "GPO restrictive. À tester sur une OU de test."
+    Write-WarningMsg "GPO restrictive. A tester sur une OU de test."
 
     $Context = Create-GPO-With-Target -DefaultName "GPO_Bloquer_CMD"
     if (-not $Context) { return }
@@ -915,14 +1239,14 @@ function New-GPO-BlockCMD {
         return
     }
 
-    Complete-GPOConfiguration -Context $Context -SuccessMessage "GPO CMD configurée."
+    Complete-GPOConfiguration -Context $Context -SuccessMessage "GPO CMD configuree."
     Pause-Toolkit
 }
 
 function New-GPO-BlockRegedit {
     Clear-Host
     Write-Host "=== GPO : BLOQUER REGEDIT ===" -ForegroundColor Cyan
-    Write-WarningMsg "GPO restrictive. À tester sur une OU de test."
+    Write-WarningMsg "GPO restrictive. A tester sur une OU de test."
 
     $Context = Create-GPO-With-Target -DefaultName "GPO_Bloquer_Regedit"
     if (-not $Context) { return }
@@ -939,7 +1263,7 @@ function New-GPO-BlockRegedit {
         return
     }
 
-    Complete-GPOConfiguration -Context $Context -SuccessMessage "GPO Regedit configurée."
+    Complete-GPOConfiguration -Context $Context -SuccessMessage "GPO Regedit configuree."
     Pause-Toolkit
 }
 
@@ -962,19 +1286,19 @@ function New-GPO-BlockControlPanel {
         return
     }
 
-    Complete-GPOConfiguration -Context $Context -SuccessMessage "GPO panneau de configuration configurée."
+    Complete-GPOConfiguration -Context $Context -SuccessMessage "GPO panneau de configuration configuree."
     Pause-Toolkit
 }
 
 function New-GPO-BlockTaskManager {
     Clear-Host
     Write-Host "=== GPO : BLOQUER GESTIONNAIRE DES TACHES ===" -ForegroundColor Cyan
-    Write-WarningMsg "GPO restrictive. À tester sur une OU de test."
+    Write-WarningMsg "GPO restrictive. A tester sur une OU de test."
 
     $Context = Create-GPO-With-Target -DefaultName "GPO_Bloquer_TaskManager"
     if (-not $Context) { return }
 
-    if (-not (Invoke-SafeAction "Configuration blocage gestionnaire des tâches" {
+    if (-not (Invoke-SafeAction "Configuration blocage gestionnaire des taches" {
         Set-GPRegistryValue `
             -Name $Context.GPOName `
             -Key "HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\System" `
@@ -986,7 +1310,7 @@ function New-GPO-BlockTaskManager {
         return
     }
 
-    Complete-GPOConfiguration -Context $Context -SuccessMessage "GPO gestionnaire des tâches configurée."
+    Complete-GPOConfiguration -Context $Context -SuccessMessage "GPO gestionnaire des taches configuree."
     Pause-Toolkit
 }
 
@@ -997,7 +1321,7 @@ function New-GPO-DisableAutorunUSB {
     $Context = Create-GPO-With-Target -DefaultName "GPO_Desactiver_Autorun_USB"
     if (-not $Context) { return }
 
-    if (-not (Invoke-SafeAction "Configuration désactivation autorun USB" {
+    if (-not (Invoke-SafeAction "Configuration desactivation autorun USB" {
         Set-GPRegistryValue `
             -Name $Context.GPOName `
             -Key "HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" `
@@ -1009,14 +1333,14 @@ function New-GPO-DisableAutorunUSB {
         return
     }
 
-    Complete-GPOConfiguration -Context $Context -SuccessMessage "GPO autorun USB configurée."
+    Complete-GPOConfiguration -Context $Context -SuccessMessage "GPO autorun USB configuree."
     Pause-Toolkit
 }
 
 function New-GPO-BlockUSBStorage {
     Clear-Host
     Write-Host "=== GPO : BLOQUER STOCKAGE USB ===" -ForegroundColor Cyan
-    Write-WarningMsg "Bloque les clés/disques USB. À tester avant prod."
+    Write-WarningMsg "Bloque les cles/disques USB. A tester avant prod."
 
     $Context = Create-GPO-With-Target -DefaultName "GPO_Bloquer_Stockage_USB"
     if (-not $Context) { return }
@@ -1033,7 +1357,7 @@ function New-GPO-BlockUSBStorage {
         return
     }
 
-    Complete-GPOConfiguration -Context $Context -SuccessMessage "GPO stockage USB configurée."
+    Complete-GPOConfiguration -Context $Context -SuccessMessage "GPO stockage USB configuree."
     Pause-Toolkit
 }
 
@@ -1060,7 +1384,7 @@ function New-GPO-EnableFirewall {
         return
     }
 
-    Complete-GPOConfiguration -Context $Context -SuccessMessage "GPO pare-feu configurée."
+    Complete-GPOConfiguration -Context $Context -SuccessMessage "GPO pare-feu configuree."
     Pause-Toolkit
 }
 
@@ -1083,7 +1407,7 @@ function New-GPO-BlockRDPPasswordSaving {
         return
     }
 
-    Complete-GPOConfiguration -Context $Context -SuccessMessage "GPO RDP configurée."
+    Complete-GPOConfiguration -Context $Context -SuccessMessage "GPO RDP configuree."
     Pause-Toolkit
 }
 
@@ -1096,7 +1420,7 @@ function New-GPO-Wallpaper {
 
     $WallpaperPath = Read-Host "Chemin UNC image, exemple \\SRV-FICHIERS\Commun\wallpaper.jpg"
 
-    if (-not (Invoke-SafeAction "Configuration fond d'écran" {
+    if (-not (Invoke-SafeAction "Configuration fond d'ecran" {
         Set-GPRegistryValue `
             -Name $Context.GPOName `
             -Key "HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\System" `
@@ -1115,7 +1439,7 @@ function New-GPO-Wallpaper {
         return
     }
 
-    Complete-GPOConfiguration -Context $Context -SuccessMessage "GPO fond d'écran configurée."
+    Complete-GPOConfiguration -Context $Context -SuccessMessage "GPO fond d'ecran configuree."
     Pause-Toolkit
 }
 
@@ -1126,9 +1450,9 @@ function New-GPO-LockScreenTimeout {
     $Context = Create-GPO-With-Target -DefaultName "GPO_Verrouillage_Session"
     if (-not $Context) { return }
 
-    $Seconds = Read-Host "Délai en secondes, exemple 900 pour 15 minutes"
+    $Seconds = Read-Host "Delai en secondes, exemple 900 pour 15 minutes"
 
-    if (-not (Invoke-SafeAction "Configuration délai verrouillage session" {
+    if (-not (Invoke-SafeAction "Configuration delai verrouillage session" {
         Set-GPRegistryValue `
             -Name $Context.GPOName `
             -Key "HKCU\Software\Policies\Microsoft\Windows\Control Panel\Desktop" `
@@ -1154,7 +1478,7 @@ function New-GPO-LockScreenTimeout {
         return
     }
 
-    Complete-GPOConfiguration -Context $Context -SuccessMessage "GPO verrouillage session configurée."
+    Complete-GPOConfiguration -Context $Context -SuccessMessage "GPO verrouillage session configuree."
     Pause-Toolkit
 }
 
@@ -1165,7 +1489,7 @@ function New-GPO-DisableMicrosoftStore {
     $Context = Create-GPO-With-Target -DefaultName "GPO_Desactiver_Microsoft_Store"
     if (-not $Context) { return }
 
-    if (-not (Invoke-SafeAction "Configuration désactivation Microsoft Store" {
+    if (-not (Invoke-SafeAction "Configuration desactivation Microsoft Store" {
         Set-GPRegistryValue `
             -Name $Context.GPOName `
             -Key "HKLM\Software\Policies\Microsoft\WindowsStore" `
@@ -1177,7 +1501,7 @@ function New-GPO-DisableMicrosoftStore {
         return
     }
 
-    Complete-GPOConfiguration -Context $Context -SuccessMessage "GPO Microsoft Store configurée."
+    Complete-GPOConfiguration -Context $Context -SuccessMessage "GPO Microsoft Store configuree."
     Pause-Toolkit
 }
 
@@ -1204,10 +1528,14 @@ function Show-OUs {
     Clear-Host
     Write-Host "=== OU EXISTANTES ===" -ForegroundColor Cyan
 
-    Get-ADOrganizationalUnit -Filter * |
-        Sort-Object DistinguishedName |
-        Select-Object Name, DistinguishedName |
-        Format-Table -AutoSize
+    try {
+        Get-ADOrganizationalUnit -Filter * |
+            Sort-Object DistinguishedName |
+            Select-Object Name, DistinguishedName |
+            Format-Table -AutoSize
+    } catch {
+        Write-ErrorMsg "Impossible d'afficher les OU : $($_.Exception.Message)"
+    }
 
     Pause-Toolkit
 }
@@ -1216,10 +1544,14 @@ function Show-Groups {
     Clear-Host
     Write-Host "=== GROUPES EXISTANTS ===" -ForegroundColor Cyan
 
-    Get-ADGroup -Filter * |
-        Sort-Object Name |
-        Select-Object Name, GroupScope, DistinguishedName |
-        Format-Table -AutoSize
+    try {
+        Get-ADGroup -Filter * |
+            Sort-Object Name |
+            Select-Object Name, SamAccountName, GroupScope, DistinguishedName |
+            Format-Table -AutoSize
+    } catch {
+        Write-ErrorMsg "Impossible d'afficher les groupes : $($_.Exception.Message)"
+    }
 
     Pause-Toolkit
 }
@@ -1228,10 +1560,14 @@ function Show-GPOs {
     Clear-Host
     Write-Host "=== GPO EXISTANTES ===" -ForegroundColor Cyan
 
-    Get-GPO -All |
-        Sort-Object DisplayName |
-        Select-Object DisplayName, Owner, CreationTime, ModificationTime |
-        Format-Table -AutoSize
+    try {
+        Get-GPO -All |
+            Sort-Object DisplayName |
+            Select-Object DisplayName, Owner, CreationTime, ModificationTime |
+            Format-Table -AutoSize
+    } catch {
+        Write-ErrorMsg "Impossible d'afficher les GPO : $($_.Exception.Message)"
+    }
 
     Pause-Toolkit
 }
@@ -1243,7 +1579,7 @@ function Backup-AllGPOs {
     $BackupPath = Read-Host "Chemin sauvegarde, exemple C:\GPO_Backup"
 
     if (Confirm-Action "Sauvegarder toutes les GPO dans $BackupPath ?") {
-        if (-not (Invoke-SafeAction "Création dossier sauvegarde" {
+        if (-not (Invoke-SafeAction "Creation dossier sauvegarde" {
             if (-not (Test-Path $BackupPath)) {
                 New-Item -ItemType Directory -Path $BackupPath -Force | Out-Null
             }
@@ -1255,7 +1591,7 @@ function Backup-AllGPOs {
         if (Invoke-SafeAction "Sauvegarde de toutes les GPO" {
             Backup-GPO -All -Path $BackupPath | Out-Null
         }) {
-            Write-Success "Sauvegarde terminée : $BackupPath"
+            Write-Success "Sauvegarde terminee : $BackupPath"
         }
     }
 
@@ -1268,10 +1604,10 @@ function Export-GPOReport {
 
     $ReportPath = Read-Host "Chemin rapport HTML, exemple C:\GPO_Report.html"
 
-    if (Invoke-SafeAction "Génération rapport HTML GPO" {
+    if (Invoke-SafeAction "Generation rapport HTML GPO" {
         Get-GPOReport -All -ReportType Html -Path $ReportPath
     }) {
-        Write-Success "Rapport créé : $ReportPath"
+        Write-Success "Rapport cree : $ReportPath"
     }
 
     Pause-Toolkit
@@ -1281,9 +1617,9 @@ function Toggle-DryRun {
     $Global:DryRun = -not $Global:DryRun
 
     if ($Global:DryRun) {
-        Write-WarningMsg "Mode simulation ACTIVÉ. Aucune modification ne sera appliquée."
+        Write-WarningMsg "Mode simulation ACTIVE. Aucune modification ne sera appliquee."
     } else {
-        Write-Success "Mode simulation DÉSACTIVÉ."
+        Write-Success "Mode simulation DESACTIVE."
     }
 
     Pause-Toolkit
@@ -1297,10 +1633,10 @@ function Menu-ADObjects {
     do {
         Clear-Host
         Write-Host "===== OBJETS ACTIVE DIRECTORY =====" -ForegroundColor Cyan
-        Write-Host "1. Créer une OU"
-        Write-Host "2. Créer un groupe"
-        Write-Host "3. Créer un utilisateur"
-        Write-Host "4. Ajouter un utilisateur à un groupe"
+        Write-Host "1. Creer une OU"
+        Write-Host "2. Creer un groupe"
+        Write-Host "3. Creer un utilisateur"
+        Write-Host "4. Ajouter un utilisateur a un groupe"
         Write-Host "5. Voir les OU"
         Write-Host "6. Voir les groupes"
         Write-Host "7. Retour"
@@ -1328,7 +1664,7 @@ function Menu-SharedFolders {
     do {
         Clear-Host
         Write-Host "===== DOSSIERS PARTAGES =====" -ForegroundColor Cyan
-        Write-Host "1. Créer un dossier partagé SMB"
+        Write-Host "1. Creer un dossier partage SMB"
         Write-Host "2. Voir les partages SMB existants"
         Write-Host "3. Tester un chemin UNC"
         Write-Host "4. Retour"
@@ -1359,19 +1695,19 @@ function Menu-GPO {
     do {
         Clear-Host
         Write-Host "===== GPO =====" -ForegroundColor Cyan
-        Write-Host "1. Créer une GPO lecteur réseau mappé"
+        Write-Host "1. Creer une GPO lecteur reseau mappe"
         Write-Host "2. Bloquer CMD"
         Write-Host "3. Bloquer Regedit"
         Write-Host "4. Bloquer panneau de configuration"
-        Write-Host "5. Bloquer gestionnaire des tâches"
-        Write-Host "6. Désactiver autorun USB"
+        Write-Host "5. Bloquer gestionnaire des taches"
+        Write-Host "6. Desactiver autorun USB"
         Write-Host "7. Bloquer stockage USB"
         Write-Host "8. Activer pare-feu Windows"
         Write-Host "9. Bloquer sauvegarde mots de passe RDP"
-        Write-Host "10. Imposer fond d'écran"
+        Write-Host "10. Imposer fond d'ecran"
         Write-Host "11. Verrouillage session automatique"
-        Write-Host "12. Désactiver Microsoft Store"
-        Write-Host "13. Lier une GPO existante à une OU"
+        Write-Host "12. Desactiver Microsoft Store"
+        Write-Host "13. Lier une GPO existante a une OU"
         Write-Host "14. Voir les GPO existantes"
         Write-Host "15. Retour"
         Write-Host ""
@@ -1407,7 +1743,7 @@ function Menu-Reports {
         Clear-Host
         Write-Host "===== RAPPORTS / MAINTENANCE =====" -ForegroundColor Cyan
         Write-Host "1. Sauvegarder toutes les GPO"
-        Write-Host "2. Générer un rapport HTML GPO"
+        Write-Host "2. Generer un rapport HTML GPO"
         Write-Host "3. Voir les OU"
         Write-Host "4. Voir les groupes"
         Write-Host "5. Voir les GPO"
@@ -1431,6 +1767,33 @@ function Menu-Reports {
     } while ($true)
 }
 
+function Menu-GPOClientTools {
+    do {
+        Clear-Host
+        Write-Host "===== OUTILS GPO CLIENT =====" -ForegroundColor Cyan
+        Write-Host "1. Lancer gpupdate /force localement"
+        Write-Host "2. Lancer gpresult /r localement"
+        Write-Host "3. Generer un rapport gpresult HTML localement"
+        Write-Host "4. Tester l'application des GPO sur le serveur actuel"
+        Write-Host "5. Retour"
+        Write-Host ""
+
+        $Choice = Read-Host "Choix"
+
+        switch ($Choice) {
+            "1" { Invoke-GpUpdateLocal }
+            "2" { Invoke-GpResultLocal }
+            "3" { New-GpResultHtmlLocal }
+            "4" { Test-CurrentServerGPOApplication }
+            "5" { return }
+            default {
+                Write-ErrorMsg "Choix invalide."
+                Pause-Toolkit
+            }
+        }
+    } while ($true)
+}
+
 function Main-Menu {
     do {
         Clear-Host
@@ -1442,12 +1805,14 @@ function Main-Menu {
         Write-Host "DryRun  : $Global:DryRun"
         Write-Host "Logs    : $Global:LogPath"
         Write-Host ""
-        Write-Host "1. Gérer les objets AD"
-        Write-Host "2. Gérer les dossiers partagés"
-        Write-Host "3. Gérer les GPO"
+        Write-Host "1. Gerer les objets AD"
+        Write-Host "2. Gerer les dossiers partages"
+        Write-Host "3. Gerer les GPO"
         Write-Host "4. Rapports / sauvegarde"
-        Write-Host "5. Activer / désactiver mode simulation"
-        Write-Host "6. Quitter"
+        Write-Host "5. Outils GPO client"
+        Write-Host "6. Verifier l'environnement"
+        Write-Host "7. Activer / desactiver mode simulation"
+        Write-Host "8. Quitter"
         Write-Host ""
 
         $Choice = Read-Host "Choix"
@@ -1457,8 +1822,10 @@ function Main-Menu {
             "2" { Menu-SharedFolders }
             "3" { Menu-GPO }
             "4" { Menu-Reports }
-            "5" { Toggle-DryRun }
-            "6" {
+            "5" { Menu-GPOClientTools }
+            "6" { Test-ToolkitEnvironment }
+            "7" { Toggle-DryRun }
+            "8" {
                 Write-Success "Fermeture du toolkit."
                 break
             }
